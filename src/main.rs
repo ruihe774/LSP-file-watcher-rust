@@ -14,13 +14,13 @@ use notify_debouncer_full::notify::{self, Watcher};
 use notify_debouncer_full::DebounceEventResult;
 use serde::Deserialize;
 
+fn parent_died() -> ! {
+    eprintln!("parent process died");
+    exit(1);
+}
+
 #[cfg(target_os = "linux")]
 fn parent_process_watchdog() {
-    fn parent_died() -> ! {
-        eprintln!("parent process died");
-        exit(1);
-    }
-
     use rustix::event::{poll, PollFd, PollFlags};
     use rustix::io::Errno;
     use rustix::process::{getppid, pidfd_open, PidfdFlags};
@@ -46,11 +46,6 @@ fn parent_process_watchdog() {
 
 #[cfg(windows)]
 fn parent_process_watchdog() {
-    fn parent_died() -> ! {
-        eprintln!("parent process died");
-        exit(1);
-    }
-
     use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
     use windows::Win32::System::Threading::{
         GetCurrentProcess, OpenProcess, WaitForSingleObject, INFINITE, PROCESS_ACCESS_RIGHTS,
