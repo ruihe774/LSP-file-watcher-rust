@@ -6,6 +6,10 @@ use std::io::{BufWriter, Write};
 use std::mem;
 use std::path::{self, PathBuf};
 use std::process::exit;
+use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 
 use glob::Pattern;
 use notify::Watcher;
@@ -17,7 +21,7 @@ fn parent_died() -> ! {
 }
 
 #[cfg(target_os = "linux")]
-fn parent_process_watchdog() {
+fn parent_process_watchdog() -> ! {
     use rustix::event::{poll, PollFd, PollFlags};
     use rustix::io::Errno;
     use rustix::process::{getppid, pidfd_open, PidfdFlags};
@@ -42,7 +46,7 @@ fn parent_process_watchdog() {
 }
 
 #[cfg(windows)]
-fn parent_process_watchdog() {
+fn parent_process_watchdog() -> ! {
     use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
     use windows::Win32::System::Threading::{
         GetCurrentProcess, OpenProcess, WaitForSingleObject, INFINITE, PROCESS_ACCESS_RIGHTS,
@@ -122,6 +126,13 @@ impl fmt::Display for EventType {
     }
 }
 
+struct Report {
+    uid: usize,
+    event: EventType,
+    path: PathBuf,
+    timestamp: Instant,
+}
+
 #[derive(Debug, Deserialize)]
 struct Register {
     cwd: String,
@@ -197,21 +208,21 @@ impl WatcherConfig {
     }
 }
 
-fn event_handler(event: notify::Result<notify::Event>, config: &WatcherConfig) {
+fn handle_event(event: notify::Result<notify::Event>, config: &WatcherConfig) -> Vec<Report> {
     use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
     use notify::EventKind;
+
+    let mut r = Vec::new();
 
     let event = match event {
         Ok(event) => event,
         Err(e) => {
             eprintln!("watcher error: {e:?}");
-            return;
+            return r;
         }
     };
     let events = [event];
 
-    let mut stdout = BufWriter::new(io::stdout().lock());
-    let mut written = false;
     for event in events {
         let event_type = match event.kind {
             EventKind::Create(create) if matches!(create, CreateKind::File) => EventType::Create,
@@ -235,7 +246,7 @@ fn event_handler(event: notify::Result<notify::Event>, config: &WatcherConfig) {
             require_literal_leading_dot: true,
         };
 
-        for path in event.paths.iter() {
+        for path in event.paths.into_iter() {
             if config
                 .patterns
                 .iter()
@@ -252,28 +263,100 @@ fn event_handler(event: notify::Result<notify::Event>, config: &WatcherConfig) {
                 continue;
             }
 
-            let path = path.to_string_lossy();
-
-            writeln!(stdout, "{}:{}:{}", config.uid, event_type, path.as_ref()).unwrap();
-            written = true;
+            r.push(Report {
+                uid: config.uid,
+                event: event_type,
+                path,
+                timestamp: Instant::now(),
+            });
         }
     }
-    if written {
-        writeln!(stdout, "<flush>").unwrap();
-        stdout.flush().unwrap();
-    }
+
+    return r;
 }
 
-fn create_watcher(reg: Register) -> notify::Result<notify::RecommendedWatcher> {
+fn create_watcher(
+    reg: Register,
+    queue: &'static Mutex<Vec<Report>>,
+) -> notify::Result<notify::RecommendedWatcher> {
     let mut config = WatcherConfig::new(reg);
     let root = mem::take(&mut config.root);
-    notify::recommended_watcher(move |event| event_handler(event, &config)).and_then(
-        |mut watcher| {
-            watcher
-                .watch(&root, notify::RecursiveMode::Recursive)
-                .map(|()| watcher)
-        },
-    )
+    notify::recommended_watcher(move |event| {
+        let mut r = handle_event(event, &config);
+        if !r.is_empty() {
+            queue.lock().unwrap().append(&mut r);
+        }
+    })
+    .and_then(|mut watcher| {
+        watcher
+            .watch(&root, notify::RecursiveMode::Recursive)
+            .map(|()| watcher)
+    })
+}
+
+fn handle_reports(queue: &'static Mutex<Vec<Report>>) -> ! {
+    let debounce = Duration::from_millis(400);
+    let mut to_sleep = debounce;
+
+    loop {
+        thread::sleep(to_sleep);
+        to_sleep = debounce;
+        let q = if let Ok(mut queue) = queue.try_lock() {
+            let Some(last_report) = queue.last() else {
+                continue;
+            };
+            let scheduled_handle_time = last_report.timestamp + debounce;
+            if let Some(new_to_sleep) = scheduled_handle_time.checked_duration_since(Instant::now())
+            {
+                to_sleep = new_to_sleep;
+                continue;
+            }
+
+            mem::take(&mut *queue)
+        } else {
+            continue;
+        };
+
+        let mut path_states = BTreeMap::new();
+        for (i, report) in q.into_iter().enumerate() {
+            let Report {
+                uid, event, path, ..
+            } = report;
+            match path_states.entry((uid, path)) {
+                Entry::Vacant(entry) => {
+                    entry.insert((i, event));
+                }
+                Entry::Occupied(mut entry) => {
+                    let stored_event = &mut entry.get_mut().1;
+                    let new_event = match (*stored_event, event) {
+                        (EventType::Delete, EventType::Create) => Some(EventType::Change),
+                        (EventType::Create, EventType::Delete) => None,
+                        (EventType::Create, EventType::Change) => Some(EventType::Create),
+                        _ => Some(event),
+                    };
+                    if let Some(new_event) = new_event {
+                        *stored_event = new_event;
+                    } else {
+                        let _ = entry.remove();
+                    }
+                }
+            }
+        }
+
+        let mut path_states: Vec<_> = path_states
+            .into_iter()
+            .map(|((uid, path), (idx, event))| (idx, uid, event, path))
+            .collect();
+        path_states.sort_unstable_by_key(|e| e.0);
+
+        let mut stdout = BufWriter::new(io::stdout().lock());
+
+        for (_, uid, event, path) in path_states {
+            let path = path.to_string_lossy();
+            writeln!(stdout, "{}:{}:{}", uid, event, path.as_ref()).unwrap();
+        }
+        writeln!(stdout, "<flush>").unwrap();
+    }
 }
 
 fn main() {
@@ -283,8 +366,11 @@ fn main() {
     #[cfg(any(target_os = "linux", windows))]
     {
         enter_efficiency_mode();
-        drop(std::thread::spawn(parent_process_watchdog));
+        drop(thread::spawn(parent_process_watchdog));
     }
+
+    let queue: &'static Mutex<Vec<Report>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+    drop(thread::spawn(move || handle_reports(queue)));
 
     let mut watchers = BTreeMap::new();
 
@@ -295,7 +381,7 @@ fn main() {
         match request {
             Request::Register(reg) => match watchers.entry(reg.uid) {
                 Entry::Occupied(_) => eprintln!("watcher with ID {} already exists", reg.uid),
-                Entry::Vacant(entry) => match create_watcher(reg) {
+                Entry::Vacant(entry) => match create_watcher(reg, queue) {
                     Ok(watcher) => {
                         entry.insert(watcher);
                     }
