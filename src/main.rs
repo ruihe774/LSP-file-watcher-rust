@@ -197,42 +197,10 @@ impl WatcherConfig {
     }
 }
 
-fn normalize_events(events: &mut Vec<notify::Event>) {
-    use notify::event::{CreateKind, EventAttributes, ModifyKind, RemoveKind, RenameMode};
-    use notify::{Event, EventKind};
-
-    let mut i = 0;
-    while i < events.len() {
-        let event = &mut events[i];
-        if let EventKind::Modify(ModifyKind::Name(rename)) = event.kind {
-            match rename {
-                RenameMode::From => {
-                    event.kind = EventKind::Remove(RemoveKind::Any);
-                }
-                RenameMode::To => {
-                    event.kind = EventKind::Create(CreateKind::Any);
-                }
-                RenameMode::Both => {
-                    assert_eq!(event.paths.len(), 2);
-                    event.kind = EventKind::Remove(RemoveKind::Any);
-                    let dest = event.paths.pop().unwrap();
-                    events.insert(
-                        i + 1,
-                        Event {
-                            kind: EventKind::Modify(ModifyKind::Name(RenameMode::To)),
-                            paths: vec![dest],
-                            attrs: EventAttributes::new(),
-                        },
-                    )
-                }
-                _ => (),
-            }
-        }
-        i += 1;
-    }
-}
-
 fn event_handler(event: notify::Result<notify::Event>, config: &WatcherConfig) {
+    use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
+    use notify::EventKind;
+
     let event = match event {
         Ok(event) => event,
         Err(e) => {
@@ -240,17 +208,20 @@ fn event_handler(event: notify::Result<notify::Event>, config: &WatcherConfig) {
             return;
         }
     };
-    let mut events = vec![event];
-
-    normalize_events(&mut events);
+    let events = [event];
 
     let mut stdout = BufWriter::new(io::stdout().lock());
     let mut written = false;
     for event in events {
         let event_type = match event.kind {
-            notify::EventKind::Create(_) => EventType::Create,
-            notify::EventKind::Modify(_) => EventType::Change,
-            notify::EventKind::Remove(_) => EventType::Delete,
+            EventKind::Create(create) if matches!(create, CreateKind::File) => EventType::Create,
+            EventKind::Remove(remove) if matches!(remove, RemoveKind::File) => EventType::Delete,
+            EventKind::Modify(modify) => match modify {
+                ModifyKind::Name(rename) if matches!(rename, RenameMode::From) => EventType::Delete,
+                ModifyKind::Name(rename) if matches!(rename, RenameMode::To) => EventType::Create,
+                ModifyKind::Data(_) | ModifyKind::Metadata(_) => EventType::Change,
+                _ => continue,
+            },
             _ => continue,
         };
 
