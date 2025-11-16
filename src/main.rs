@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use glob::Pattern;
-use notify_debouncer_full::notify::{self, Watcher};
+use notify_debouncer_full::notify;
 use notify_debouncer_full::DebounceEventResult;
 use serde::Deserialize;
 
@@ -76,7 +76,7 @@ fn parent_process_watchdog() {
 
 #[cfg(target_os = "linux")]
 fn enter_efficiency_mode() {
-    use rustix::process::{sched_setscheduler, SchedPolicy, SchedParam};
+    use rustix::process::{sched_setscheduler, SchedParam, SchedPolicy};
 
     let _ = sched_setscheduler(None, SchedPolicy::Batch, &SchedParam::default());
 }
@@ -338,9 +338,7 @@ fn main() {
                     if let Some(count) = watching_path.get_mut(&config.cwd) {
                         *count += 1;
                     } else {
-                        if let Err(e) = watcher
-                            .watcher()
-                            .watch(&config.cwd, notify::RecursiveMode::Recursive)
+                        if let Err(e) = watcher.watch(&config.cwd, notify::RecursiveMode::Recursive)
                         {
                             eprintln!("failed to watch on path: {e:?}");
                             continue;
@@ -361,7 +359,7 @@ fn main() {
                                 config.cwd.starts_with(path) || path.starts_with(&config.cwd)
                             })
                         {
-                            watcher.watcher().unwatch(&config.cwd).unwrap();
+                            watcher.unwatch(&config.cwd).unwrap();
                         }
                     }
                 } else {
