@@ -15,6 +15,7 @@ use glob::Pattern;
 use notify::Watcher;
 use serde::Deserialize;
 
+#[cfg(any(target_os = "linux", windows))]
 fn parent_died() -> ! {
     eprintln!("parent process died");
     exit(1);
