@@ -105,7 +105,7 @@ class ProcessHandler(TransportCallbacks[str]):
         self.end_process(exit_code, exception)
 
 
-class FileWatcherController(FileWatcher, EventCollector):
+class FileWatcherController(FileWatcher):
 
     @classmethod
     def create(
@@ -125,7 +125,7 @@ class FileWatcherController(FileWatcher, EventCollector):
         self._on_destroy()
 
 
-class RustFileWatcher:
+class RustFileWatcher(EventCollector):
 
     def __init__(self) -> None:
         self._last_controller_id = 0
