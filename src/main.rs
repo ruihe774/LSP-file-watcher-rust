@@ -11,7 +11,7 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
-use glob::Pattern;
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use notify::Watcher;
 use serde::Deserialize;
 
@@ -154,8 +154,8 @@ enum Request {
 struct WatcherConfig {
     root: PathBuf,
     events: Vec<EventType>,
-    ignores: Vec<Pattern>,
-    patterns: Vec<Pattern>,
+    ignores: GlobSet,
+    patterns: GlobSet,
     prefixes: Vec<PathBuf>,
     uid: usize,
 }
@@ -177,23 +177,29 @@ impl WatcherConfig {
             })
         }
 
-        let paths_to_patterns = |paths: &Vec<String>| {
+        let build_globset = |paths: &Vec<String>| {
             make_absolute_paths(&root, paths)
                 .filter_map(|path| {
-                    Pattern::new(path.to_string_lossy().as_ref()).map_or_else(
-                        |e| {
-                            eprintln!("invalid glob pattern: {e:?}");
-                            None
-                        },
-                        |pat| Some(pat),
-                    )
+                    GlobBuilder::new(path.to_string_lossy().as_ref())
+                        .literal_separator(true)
+                        .build()
+                        .map_or_else(
+                            |e| {
+                                eprintln!("invalid glob pattern: {e:?}");
+                                None
+                            },
+                            |pat| Some(pat),
+                        )
                 })
-                .collect()
+                .fold(GlobSetBuilder::new(), |mut set, glob| {
+                    set.add(glob);
+                    set
+                }).build().unwrap()
         };
 
         let prefixes: Vec<_> = make_absolute_paths(&root, &reg.patterns).collect();
-        let patterns = paths_to_patterns(&reg.patterns);
-        let ignores = paths_to_patterns(&reg.ignores);
+        let patterns = build_globset(&reg.patterns);
+        let ignores = build_globset(&reg.ignores);
 
         let uid = reg.uid;
         let events = reg.events;
@@ -270,35 +276,21 @@ fn handle_event(event: notify::Result<notify::Event>, config: &WatcherConfig) ->
             continue;
         }
 
-        let options = glob::MatchOptions {
-            case_sensitive: true,
-            require_literal_separator: true,
-            require_literal_leading_dot: true,
-        };
-
         for path in event.paths.into_iter() {
-            if config
-                .patterns
-                .iter()
-                .all(|pattern| !pattern.matches_path_with(&path, options))
-                && config
+            if (config.patterns.is_match(&path)
+                || config
                     .prefixes
                     .iter()
-                    .all(|prefix| !path.starts_with(prefix))
-                || config
-                    .ignores
-                    .iter()
-                    .any(|ignore| ignore.matches_path_with(&path, options))
+                    .any(|prefix| path.starts_with(prefix)))
+                && !config.ignores.is_match(&path)
             {
-                continue;
+                r.push(Report {
+                    uid: config.uid,
+                    event: event_type,
+                    path,
+                    timestamp: Instant::now(),
+                });
             }
-
-            r.push(Report {
-                uid: config.uid,
-                event: event_type,
-                path,
-                timestamp: Instant::now(),
-            });
         }
     }
 
